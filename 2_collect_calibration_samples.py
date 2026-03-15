@@ -179,9 +179,21 @@ def build_object_points(pattern_size, square_size_m):
     Generate 3D coordinates of checkerboard corners in board frame.
     """
     cols, rows = pattern_size
+    # pattern_size defines the number of inner corners in the checkerboard
+
     objp = np.zeros((cols * rows, 3), np.float32)
+    # Create an array to store the 3D coordinates of all corners
+    # Shape = (number_of_points, 3) for (x, y, z)
+
     objp[:, :2] = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2)
+    # These values are assigned to the first two columns of objp
+    # representing the (x, y) positions of each corner
+
     objp *= square_size_m
+    # Convert grid indices into real-world distances
+    # Each grid step corresponds to one checkerboard square
+    # Multiply by the physical square size (in meters)
+    
     return objp
 
 def detect_checkerboard_pose(image_bgr, K, dist, pattern_size, square_size_m):
