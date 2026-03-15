@@ -30,7 +30,7 @@ MAX_Z_MM = 650
 
 # Checkerboard settings
 # !!! You must verify this !!!
-PATTERN_SIZE = (6, 7)      # try (6,7) first; if fails, test (7,8)
+PATTERN_SIZE = (6, 7)      # square is 7×8，inner corner is 6x7
 SQUARE_SIZE_M = 0.03       # 30 mm
 
 # ZED settings
@@ -47,6 +47,9 @@ def ensure_dir(path):
     Path(path).mkdir(parents=True, exist_ok=True)
 
 def pose_to_dict(pose):
+    """
+    Convert robot pose list to dictionary format.
+    """
     return {
         "x": pose[0],
         "y": pose[1],
@@ -72,6 +75,12 @@ def move_pose(arm, x, y, z, roll, pitch, yaw, label=""):
     return code
 
 def move_two_stage(arm, target_tcp):
+    """
+    Move the robot using a two-stage safe motion:
+    1. Lift vertically to a safe Z height
+    2. Move laterally in XY at the safe height
+    3. Descend vertically to the target pose
+    """
     code_pose, current_pose = arm.get_position(is_radian=USE_RADIANS)
     if code_pose != 0:
         print(f"Failed to read current pose, code={code_pose}")
@@ -90,16 +99,19 @@ def move_two_stage(arm, target_tcp):
 
     print(f"  Current z: {cz:.2f}, Target z: {tz:.2f}, Safe z: {safe_z:.2f}")
 
+    # Stage 1: Lift vertically
     code = move_pose(arm, cx, cy, safe_z, croll, cpitch, cyaw, label="raise-to-safe-z")
     if code != 0:
         return code
     time.sleep(0.2)
 
+    # Stage 2: Move laterally
     code = move_pose(arm, tx, ty, safe_z, troll, tpitch, tyaw, label="lateral-at-safe-z")
     if code != 0:
         return code
     time.sleep(0.2)
 
+    # Stage 3: Descend vertically
     code = move_pose(arm, tx, ty, tz, troll, tpitch, tyaw, label="descend-to-target")
     return code
 
@@ -120,6 +132,9 @@ def init_zed():
     return zed, runtime_params
 
 def get_left_image_bgr(zed, runtime_params):
+    """
+    Capture a frame from the ZED left camera and convert it to OpenCV BGR format.
+    """
     image = sl.Mat()
     if zed.grab(runtime_params) != sl.ERROR_CODE.SUCCESS:
         return None
@@ -129,6 +144,7 @@ def get_left_image_bgr(zed, runtime_params):
     if frame is None:
         return None
 
+    # Convert RGBA to BGR for OpenCV
     if frame.shape[2] == 4:
         frame_bgr = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
     else:
@@ -136,6 +152,10 @@ def get_left_image_bgr(zed, runtime_params):
     return frame_bgr
 
 def get_camera_matrix_and_dist(zed):
+    """
+    Retrieve camera intrinsic matrix and distortion coefficients
+    from the ZED SDK calibration parameters.
+    """
     calib = zed.get_camera_information().camera_configuration.calibration_parameters
     left_cam = calib.left_cam
 
@@ -144,8 +164,6 @@ def get_camera_matrix_and_dist(zed):
     cx = left_cam.cx
     cy = left_cam.cy
 
-    # distortion order may depend on SDK version
-    # Often [k1, k2, p1, p2, k3]
     dist = np.array(left_cam.disto, dtype=np.float64)
 
     K = np.array([
@@ -157,6 +175,9 @@ def get_camera_matrix_and_dist(zed):
     return K, dist
 
 def build_object_points(pattern_size, square_size_m):
+    """
+    Generate 3D coordinates of checkerboard corners in board frame.
+    """
     cols, rows = pattern_size
     objp = np.zeros((cols * rows, 3), np.float32)
     objp[:, :2] = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2)
@@ -164,6 +185,10 @@ def build_object_points(pattern_size, square_size_m):
     return objp
 
 def detect_checkerboard_pose(image_bgr, K, dist, pattern_size, square_size_m):
+    """
+    Detect checkerboard corners and estimate board pose
+    relative to the camera using solvePnP.
+    """
     gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
 
     flags = cv2.CALIB_CB_ADAPTIVE_THRESH + cv2.CALIB_CB_NORMALIZE_IMAGE
@@ -174,6 +199,7 @@ def detect_checkerboard_pose(image_bgr, K, dist, pattern_size, square_size_m):
     if not found:
         return False, None, None, None, vis
 
+    # Refine corner detection
     criteria = (
         cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER,
         30,
@@ -185,6 +211,7 @@ def detect_checkerboard_pose(image_bgr, K, dist, pattern_size, square_size_m):
 
     objp = build_object_points(pattern_size, square_size_m)
 
+    # Estimate pose using PnP
     ok, rvec, tvec = cv2.solvePnP(
         objp,
         corners_refined,
@@ -204,6 +231,13 @@ def detect_checkerboard_pose(image_bgr, K, dist, pattern_size, square_size_m):
 # Main
 # =========================
 def main():
+     """
+    Main pipeline for collecting calibration samples:
+    1. Move robot to predefined poses
+    2. Capture ZED image
+    3. Detect checkerboard
+    4. Save pose + image + board pose
+    """
     pose_path = Path(POSE_FILE)
     if not pose_path.exists():
         print(f"Pose file not found: {POSE_FILE}")
