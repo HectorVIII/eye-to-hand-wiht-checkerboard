@@ -7,18 +7,19 @@ ROBOT_IP = "192.168.1.225"
 POSE_FILE = "robot_poses.json"
 
 # Motion parameters
-SPEED_MM_S = 50
-ACC_MM_S2 = 200
-WAIT_AFTER_MOVE = 1.5
-USE_RADIANS = True
-CONFIRM_EACH_POSE = True
+SPEED_MM_S = 50             #linear speed mm/s
+ACC_MM_S2 = 200             #accelerate speed
+WAIT_AFTER_MOVE = 1.5       #After reaching each point, wait 1.5 seconds
+USE_RADIANS = True          #Angle units are in radians
+CONFIRM_EACH_POSE = True    #manually press Enter to confirm before each pose.
 
 # Safe motion parameters
-SAFE_Z_MM = 450           # base frame 下的保守安全高度，按你的工作空间修改
-Z_LIFT_MARGIN_MM = 80     # 比当前/目标更高一些的额外抬升量
-MIN_Z_MM = 120            # 可选：避免目标过低
-MAX_Z_MM = 650            # 可选：避免目标过高
+SAFE_Z_MM = 450           # safety height, Before moving sideways, the robot should first raise itself as close as possible to this height
+Z_LIFT_MARGIN_MM = 80     # Raise an additional 80 mm
+MIN_Z_MM = 120           
+MAX_Z_MM = 650           
 
+# Limit the z-height to prevent it from being too low or too high
 def clamp(value, low, high):
     return max(low, min(high, value))
 

@@ -10,7 +10,7 @@ from xarm.wrapper import XArmAPI
 # =========================
 # User settings
 # =========================
-ROBOT_IP = "192.168.1.XXX"
+ROBOT_IP = "192.168.1.225"
 POSE_FILE = "robot_poses.json"
 SAVE_DIR = "calib_dataset"
 
