@@ -2,20 +2,23 @@
 # -*- coding: utf-8 -*-
 
 """
-zed_wrist_hover_move.py
+zed_wrist_move_once_single_person.py
 
 Workflow:
     1. Detect and track the user's right wrist with ZED2
     2. Convert wrist point from camera frame to robot base frame using T_cam2base
     3. Filter the wrist position
-    4. If the filtered wrist stays sufficiently still for 2 seconds,
-       generate a hover target above the wrist in base frame
-    5. Only when user presses 'g', move xArm slowly to that hover target
+    4. If the filtered wrist stays sufficiently still for a while,
+       generate a target near the wrist in base frame
+    5. Move xArm ONLY ONCE
+    6. After the robot reaches the target, end the program directly
 
-Notes:
-    - This script moves to a hover point above the wrist, not to the wrist itself
-    - It preserves a fixed tool orientation captured at startup
-    - Motion is limited by workspace checks and low speed
+Current behavior:
+    - Single-person testing style
+    - No locked body ID
+    - No "choose nearest body" logic
+    - In each frame, whichever body FIRST satisfies the wrist condition is used
+    - After one successful detection + move, the task ends
 """
 
 import time
@@ -29,7 +32,6 @@ from xarm.wrapper import XArmAPI
 
 # =========================================================
 # Hard-coded hand-eye result (camera -> base)
-# from your current best_result = HORAUD
 # =========================================================
 T_cam2base = np.array([
     [-0.691532644,  0.326676329, -0.644255523,  0.853619759],
@@ -44,7 +46,7 @@ T_cam2base = np.array([
 ROBOT_IP = "192.168.1.225"
 USE_RADIANS = True
 
-WINDOW_NAME = "ZED Wrist Hover Target + Confirmed xArm Move"
+WINDOW_NAME = "ZED Wrist Detect -> xArm Move Once"
 
 # BODY_34 right wrist index
 RIGHT_WRIST_IDX = 14
@@ -52,37 +54,35 @@ USE_KEYPOINT_NAME = "RIGHT_WRIST"
 
 # ZED settings
 USE_HD720 = True
-CAMERA_FPS = 30
+CAMERA_FPS = 60
 COORDINATE_SYSTEM = sl.COORDINATE_SYSTEM.IMAGE
-DEPTH_MODE = sl.DEPTH_MODE.ULTRA
+DEPTH_MODE = sl.DEPTH_MODE.NEURAL
 DEPTH_MIN_M = 0.15
 DEPTH_MAX_M = 2.00
 
 # Body tracking
-BODY_MODEL = sl.BODY_TRACKING_MODEL.HUMAN_BODY_MEDIUM
+BODY_MODEL = sl.BODY_TRACKING_MODEL.HUMAN_BODY_ACCURATE
 BODY_FORMAT = sl.BODY_FORMAT.BODY_34
-DETECTION_CONF_THRESH = 50
+DETECTION_CONF_THRESH = 40
 
 # Filtering
-MEDIAN_WINDOW = 5
-EMA_ALPHA = 0.35
-MAX_JUMP_M = 0.25
+MEDIAN_WINDOW = 7
+EMA_ALPHA = 0.20
+MAX_JUMP_M = 0.18
 
 # Static detection
-STATIC_TIME_S = 2.0
-STATIC_RADIUS_M = 0.02   # wrist filtered point must stay within 2 cm ball
+STATIC_TIME_S = 1.5
+STATIC_RADIUS_M = 0.04
 
-# Hover target in robot base frame
-WRIST_HOVER_OFFSET_M = np.array([0.0, 0.0, 0.20], dtype=np.float64)
+# Target in robot base frame
+# Move to wrist directly: [0, 0, 0]
+# Move above wrist by 20 cm: [0, 0, 0.20]
+WRIST_TARGET_OFFSET_M = np.array([0.0, 0.0, 0.02], dtype=np.float64)
 
 # Robot motion
 MOVE_SPEED_MM_S = 40
 MOVE_ACC_MM_S2 = 100
 WAIT_AFTER_MOVE_S = 0.5
-
-# Fixed orientation captured at startup from current robot TCP axis-angle
-# We will keep this orientation during all hover moves
-USE_STARTUP_ORIENTATION = True
 
 # Safety workspace in base frame (meters)
 X_MIN, X_MAX = 0.20, 0.80
@@ -111,6 +111,8 @@ def median_filter_point(buffer):
 
 
 def ema_update(prev, current, alpha):
+    if current is None:
+        return prev
     if prev is None:
         return current.copy()
     return alpha * current + (1.0 - alpha) * prev
@@ -147,38 +149,6 @@ def draw_text_block(img, lines, org=(20, 35), dy=28, color=(0, 255, 0)):
             cv2.LINE_AA,
         )
         y += dy
-
-
-def choose_body_to_track(body_list, locked_id):
-    if not body_list:
-        return None, locked_id
-
-    if locked_id is not None:
-        for body in body_list:
-            if body.id == locked_id:
-                return body, locked_id
-
-    best_body = None
-    best_depth = 1e9
-
-    for body in body_list:
-        keypoints_3d = body.keypoint
-        if len(keypoints_3d) <= RIGHT_WRIST_IDX:
-            continue
-
-        p3d = keypoints_3d[RIGHT_WRIST_IDX]
-        if not is_valid_point(p3d):
-            continue
-
-        z = float(p3d[2])
-        if z < best_depth:
-            best_depth = z
-            best_body = body
-
-    if best_body is None:
-        return None, None
-
-    return best_body, best_body.id
 
 
 def workspace_ok(p_base):
@@ -230,12 +200,7 @@ def move_pose_aa(arm, pose_aa):
         raise RuntimeError(f"set_position_aa failed, code={code}")
 
 
-def move_hover_pose(arm, target_base_xyz_m, fixed_orientation_rvec):
-    """
-    Move TCP to hover point in base frame.
-    Position is in meters; xArm expects mm.
-    Orientation is axis-angle rotation vector in radians.
-    """
+def move_target_pose(arm, target_base_xyz_m, fixed_orientation_rvec):
     target_mm = target_base_xyz_m * 1000.0
 
     pose_aa = np.array([
@@ -271,45 +236,21 @@ def create_zed():
     return zed
 
 
-def tune_camera(zed):
-    try:
-        zed.set_camera_settings(sl.VIDEO_SETTINGS.AEC_AGC, 0)
-    except Exception:
-        pass
-
-    try:
-        zed.set_camera_settings(sl.VIDEO_SETTINGS.WHITEBALANCE_AUTO, 0)
-    except Exception:
-        pass
-
-    try:
-        zed.set_camera_settings(sl.VIDEO_SETTINGS.EXPOSURE, 50)
-    except Exception:
-        pass
-
-    try:
-        zed.set_camera_settings(sl.VIDEO_SETTINGS.GAIN, 50)
-    except Exception:
-        pass
-
-
 # =========================================================
 # Main
 # =========================================================
 def main():
     print("=" * 78)
-    print("ZED Wrist Hover Target + Confirmed xArm Move")
+    print("ZED Wrist Detect -> xArm Move Once")
     print("=" * 78)
     print("Controls:")
     print("  q -> quit")
     print("  r -> reset tracking / filters / static detector")
-    print("  g -> move to current READY hover target")
     print()
 
     zed = None
     arm = None
 
-    locked_body_id = None
     wrist_buffer = deque(maxlen=MEDIAN_WINDOW)
     filtered_cam = None
     filtered_base = None
@@ -317,9 +258,10 @@ def main():
     static_anchor = None
     static_start_time = None
     target_ready = False
-    hover_target_base = None
+    target_base = None
 
     last_print_time = 0.0
+    task_finished = False
 
     try:
         arm = connect_arm(ROBOT_IP)
@@ -332,7 +274,6 @@ def main():
         print("Using fixed orientation rvec (rad):", startup_orientation_rvec)
 
         zed = create_zed()
-        tune_camera(zed)
 
         positional_tracking_params = sl.PositionalTrackingParameters()
         err = zed.enable_positional_tracking(positional_tracking_params)
@@ -360,6 +301,10 @@ def main():
         cv2.resizeWindow(WINDOW_NAME, 1600, 900)
 
         while True:
+            if task_finished:
+                print("[Task Finished] One detection + one move completed. Exiting program.")
+                break
+
             if zed.grab(runtime) != sl.ERROR_CODE.SUCCESS:
                 continue
 
@@ -374,110 +319,148 @@ def main():
             lines = []
             wrist_found = False
 
-            body, locked_body_id = choose_body_to_track(bodies.body_list, locked_body_id)
+            # -------------------------------------------------
+            # Single-person test logic:
+            # use the FIRST body whose right wrist is valid
+            # -------------------------------------------------
+            body = None
+            p2d = None
+            p3d = None
+
+            for candidate in bodies.body_list:
+                keypoints_2d = candidate.keypoint_2d
+                keypoints_3d = candidate.keypoint
+
+                if len(keypoints_2d) <= RIGHT_WRIST_IDX or len(keypoints_3d) <= RIGHT_WRIST_IDX:
+                    continue
+
+                candidate_p3d = np.array(keypoints_3d[RIGHT_WRIST_IDX], dtype=np.float64)
+                if not is_valid_point(candidate_p3d):
+                    continue
+
+                candidate_p2d = keypoints_2d[RIGHT_WRIST_IDX]
+
+                # Whoever first satisfies the condition is used
+                body = candidate
+                p2d = candidate_p2d
+                p3d = candidate_p3d
+                break
 
             if body is not None:
-                keypoints_2d = body.keypoint_2d
-                keypoints_3d = body.keypoint
+                if filtered_cam is not None:
+                    jump = np.linalg.norm(p3d - filtered_cam)
+                    if jump > MAX_JUMP_M:
+                        p3d = None
 
-                if len(keypoints_2d) > RIGHT_WRIST_IDX and len(keypoints_3d) > RIGHT_WRIST_IDX:
-                    p2d = keypoints_2d[RIGHT_WRIST_IDX]
-                    p3d = np.array(keypoints_3d[RIGHT_WRIST_IDX], dtype=np.float64)
+                if p3d is not None and is_valid_point(p3d):
+                    wrist_found = True
 
-                    if is_valid_point(p3d):
-                        if filtered_cam is not None:
-                            jump = np.linalg.norm(p3d - filtered_cam)
-                            if jump > MAX_JUMP_M:
-                                p3d = None
+                    x_px, y_px = int(p2d[0]), int(p2d[1])
+                    cv2.circle(vis, (x_px, y_px), 8, (0, 255, 0), -1)
+                    cv2.putText(
+                        vis,
+                        f"{USE_KEYPOINT_NAME} (ID {body.id})",
+                        (x_px + 10, y_px - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7,
+                        (0, 255, 0),
+                        2,
+                        cv2.LINE_AA,
+                    )
 
-                        if p3d is not None and is_valid_point(p3d):
-                            wrist_found = True
+                    wrist_buffer.append(p3d)
+                    median_cam = median_filter_point(wrist_buffer)
+                    filtered_cam = ema_update(filtered_cam, median_cam, EMA_ALPHA)
 
-                            x_px, y_px = int(p2d[0]), int(p2d[1])
-                            cv2.circle(vis, (x_px, y_px), 8, (0, 255, 0), -1)
-                            cv2.putText(
-                                vis,
-                                f"{USE_KEYPOINT_NAME} (ID {body.id})",
-                                (x_px + 10, y_px - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.7,
-                                (0, 255, 0),
-                                2,
-                                cv2.LINE_AA,
+                    filtered_base = cam_point_to_base(T_cam2base, filtered_cam)
+
+                    now = time.time()
+
+                    # Static detector
+                    if static_anchor is None:
+                        static_anchor = filtered_base.copy()
+                        static_start_time = now
+                        target_ready = False
+                        target_base = None
+                    else:
+                        dist = np.linalg.norm(filtered_base - static_anchor)
+                        if dist <= STATIC_RADIUS_M:
+                            if (now - static_start_time) >= STATIC_TIME_S:
+                                target_ready = True
+                                target_base = filtered_base + WRIST_TARGET_OFFSET_M
+                                target_base = clamp_workspace(target_base)
+                        else:
+                            static_anchor = filtered_base.copy()
+                            static_start_time = now
+                            target_ready = False
+                            target_base = None
+
+                    static_elapsed = 0.0 if static_start_time is None else (now - static_start_time)
+
+                    # Once target is ready -> move once -> finish task
+                    if target_ready and target_base is not None:
+                        print("[Target Locked] Stable wrist detected.")
+                        print("[Target Base m]:", target_base)
+
+                        if workspace_ok(target_base):
+                            print("[Move] Moving xArm to target...")
+                            move_target_pose(
+                                arm=arm,
+                                target_base_xyz_m=target_base,
+                                fixed_orientation_rvec=startup_orientation_rvec,
                             )
+                            print("[Done] Robot reached target.")
+                            task_finished = True
+                        else:
+                            print("[Warning] Target out of workspace even after clamp.")
+                            task_finished = True
 
-                            # Filter in camera frame
-                            wrist_buffer.append(p3d)
-                            median_cam = median_filter_point(wrist_buffer)
-                            filtered_cam = ema_update(filtered_cam, median_cam, EMA_ALPHA)
+                    status_text = "Detecting steady wrist..."
+                    if target_ready:
+                        status_text = "TARGET LOCKED -> MOVING"
 
-                            # Convert to base frame after filtering
-                            filtered_base = cam_point_to_base(T_cam2base, filtered_cam)
+                    lines = [
+                        f"Tracked body id   : {body.id}",
+                        f"Camera filt (m)   : x={filtered_cam[0]: .3f}, y={filtered_cam[1]: .3f}, z={filtered_cam[2]: .3f}",
+                        f"Base filt (m)     : x={filtered_base[0]: .3f}, y={filtered_base[1]: .3f}, z={filtered_base[2]: .3f}",
+                        f"Static elapsed    : {static_elapsed: .2f} / {STATIC_TIME_S:.2f} s",
+                        f"Static radius     : {STATIC_RADIUS_M:.3f} m",
+                        f"Status            : {status_text}",
+                    ]
 
-                            # Static detector in base frame
-                            now = time.time()
-                            if static_anchor is None:
-                                static_anchor = filtered_base.copy()
-                                static_start_time = now
-                                target_ready = False
-                                hover_target_base = None
-                            else:
-                                dist = np.linalg.norm(filtered_base - static_anchor)
-                                if dist <= STATIC_RADIUS_M:
-                                    if (now - static_start_time) >= STATIC_TIME_S:
-                                        target_ready = True
-                                        hover_target_base = filtered_base + WRIST_HOVER_OFFSET_M
-                                        hover_target_base = clamp_workspace(hover_target_base)
-                                else:
-                                    static_anchor = filtered_base.copy()
-                                    static_start_time = now
-                                    target_ready = False
-                                    hover_target_base = None
+                    if target_base is not None:
+                        lines.append(
+                            f"Target (m)        : x={target_base[0]: .3f}, y={target_base[1]: .3f}, z={target_base[2]: .3f}"
+                        )
+                        lines.append(
+                            f"Workspace check   : {'OK' if workspace_ok(target_base) else 'CLAMPED'}"
+                        )
 
-                            static_elapsed = 0.0 if static_start_time is None else (now - static_start_time)
-
-                            if target_ready and hover_target_base is not None:
-                                cv2.circle(vis, (x_px, y_px), 14, (0, 255, 255), 2)
-                                ready_text = "READY: press 'g' to move to hover target"
-                            else:
-                                ready_text = "Waiting for wrist to stay still 2.0 s"
-
-                            lines = [
-                                f"Tracked body id   : {body.id}",
-                                f"Camera filt (m)   : x={filtered_cam[0]: .3f}, y={filtered_cam[1]: .3f}, z={filtered_cam[2]: .3f}",
-                                f"Base filt (m)     : x={filtered_base[0]: .3f}, y={filtered_base[1]: .3f}, z={filtered_base[2]: .3f}",
-                                f"Static elapsed    : {static_elapsed: .2f} / {STATIC_TIME_S:.2f} s",
-                                f"Static radius     : {STATIC_RADIUS_M:.3f} m",
-                                ready_text,
-                            ]
-
-                            if hover_target_base is not None:
-                                ok = workspace_ok(hover_target_base)
-                                lines.append(
-                                    f"Hover target (m)  : x={hover_target_base[0]: .3f}, y={hover_target_base[1]: .3f}, z={hover_target_base[2]: .3f}"
-                                )
-                                lines.append(f"Workspace check    : {'OK' if ok else 'CLAMPED'}")
-
-                            if now - last_print_time > PRINT_INTERVAL_S:
-                                print("-" * 60)
-                                print(f"Tracked body id    : {body.id}")
-                                print(f"Camera filt (m)    : {filtered_cam}")
-                                print(f"Base filt (m)      : {filtered_base}")
-                                if hover_target_base is not None:
-                                    print(f"Hover target (m)   : {hover_target_base}")
-                                    print(f"Target ready       : {target_ready}")
-                                last_print_time = now
+                    if now - last_print_time > PRINT_INTERVAL_S:
+                        print("-" * 60)
+                        print(f"Tracked body id    : {body.id}")
+                        print(f"Camera filt (m)    : {filtered_cam}")
+                        print(f"Base filt (m)      : {filtered_base}")
+                        if target_base is not None:
+                            print(f"Target (m)         : {target_base}")
+                            print(f"Target ready       : {target_ready}")
+                        last_print_time = now
 
             if not wrist_found:
                 lines = [
                     "Right wrist not detected / invalid / rejected",
-                    f"Tracked body id   : {locked_body_id}",
+                    "Tracked body id   : None",
                     "Tips:",
                     "- face camera more directly",
                     "- keep wrist inside image",
                     "- keep wrist at moderate depth",
-                    "- press 'r' if tracking locked wrong",
+                    "- press 'r' to reset filters",
                 ]
+
+                static_anchor = None
+                static_start_time = None
+                target_ready = False
+                target_base = None
 
             draw_text_block(vis, lines, org=(20, 35), dy=28, color=(0, 255, 0))
 
@@ -499,38 +482,14 @@ def main():
                 break
 
             elif key == ord("r"):
-                locked_body_id = None
                 wrist_buffer.clear()
                 filtered_cam = None
                 filtered_base = None
                 static_anchor = None
                 static_start_time = None
                 target_ready = False
-                hover_target_base = None
+                target_base = None
                 print("Tracking, filters, and static detector reset.")
-
-            elif key == ord("g"):
-                if not target_ready or hover_target_base is None:
-                    print("[Skip] Hover target is not ready yet.")
-                    continue
-
-                if not workspace_ok(hover_target_base):
-                    print("[Skip] Hover target outside workspace.")
-                    continue
-
-                print("[Move] Moving to hover target (m):", hover_target_base)
-                move_hover_pose(
-                    arm=arm,
-                    target_base_xyz_m=hover_target_base,
-                    fixed_orientation_rvec=startup_orientation_rvec,
-                )
-                print("[Done] Reached hover target.")
-
-                # Force reacquire after move
-                static_anchor = None
-                static_start_time = None
-                target_ready = False
-                hover_target_base = None
 
     except KeyboardInterrupt:
         print("\nInterrupted by user.")

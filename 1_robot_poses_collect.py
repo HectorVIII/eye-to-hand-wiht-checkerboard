@@ -399,7 +399,7 @@ def main():
         arm = connect_arm(ROBOT_IP)
 
         zed, runtime, image_mat = create_zed()
-        set_zed_camera_params(zed)
+        #set_zed_camera_params(zed)
 
         cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(WINDOW_NAME, 1600, 900)
