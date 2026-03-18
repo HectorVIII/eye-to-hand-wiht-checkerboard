@@ -42,7 +42,7 @@ from xarm.wrapper import XArmAPI
 # =========================================================
 ROBOT_IP = "192.168.1.225"
 
-POSE_FILE = Path("robot_poses_20.json")
+POSE_FILE = Path("robot_poses_30.json")
 SAVE_DIR = Path("calib_dataset")
 IMAGE_DIR = SAVE_DIR / "images"
 SAMPLES_FILE = SAVE_DIR / "samples.json"
@@ -58,9 +58,9 @@ USE_HD720 = True
 WINDOW_NAME = "Capture Calibration Dataset"
 
 # Motion parameters
-SPEED_MM_S = 25
+SPEED_MM_S = 40
 ACC_MM_S2 = 100
-WAIT_AFTER_MOVE_S = 2.0
+WAIT_AFTER_MOVE_S = 3.0
 
 # Two-stage safe motion
 SAFE_Z_MM = 450.0

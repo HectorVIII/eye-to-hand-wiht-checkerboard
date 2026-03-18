@@ -10,11 +10,17 @@ Workflow:
     1. Put xArm into manual / drag mode using your normal workflow.
     2. Move robot by hand until the checkerboard is fully visible and stably detected.
     3. Press 's' to save the current robot pose.
+       At the same time:
+         - save current camera image
+         - print robot TCP xyzrpy
+         - print checkerboard position in camera frame
     4. Repeat until enough poses are collected.
     5. Press 'q' to quit.
 
-This script saves robot poses only.
-It does not yet save full calibration samples.
+Important:
+    - The JSON save format of robot_poses_20.json is NOT changed.
+    - Extra information is only printed in terminal.
+    - Images are saved separately in pose_images/.
 """
 
 import json
@@ -33,14 +39,16 @@ from xarm.wrapper import XArmAPI
 # User settings
 # =========================================================
 ROBOT_IP = "192.168.1.225"
-SAVE_FILE = Path("robot_poses_20.json")
+SAVE_FILE = Path("robot_poses_30.json")
+IMAGE_SAVE_DIR = Path("pose_images")
 
 USE_RADIANS = True
-TARGET_NUM_POSES = 20
+TARGET_NUM_POSES = 30
 
 # Your current board setting
 # Keep this as you requested
 PATTERNS_TO_TEST = [(6, 7)]
+SQUARE_SIZE_M = 0.03  # 30 mm
 
 USE_HD720 = True
 
@@ -61,6 +69,10 @@ READ_STABLE_DELAY_S = 0.15
 # =========================================================
 def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def compact_time_str():
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
 
 
 def round_list(values, digits=6):
@@ -118,6 +130,7 @@ def get_robot_state(arm, use_radians=True):
 
 
 def build_pose_record(idx, pose_rpy, pose_aa, joints):
+    # Keep original JSON structure unchanged
     return {
         "id": idx,
         "timestamp": now_str(),
@@ -149,38 +162,47 @@ def create_zed():
     return zed, runtime, image_mat
 
 
-def set_zed_camera_params(zed):
-    """
-    Optional camera tuning for more stable checkerboard detection.
-    If any setting fails on your SDK version, the exception is ignored.
-    """
-    try:
-        # Turn off auto exposure / auto white balance if supported
-        zed.set_camera_settings(sl.VIDEO_SETTINGS.AEC_AGC, 0)
-    except Exception:
-        pass
+def get_camera_intrinsics(zed):
+    cam_info = zed.get_camera_information()
+    calib = cam_info.camera_configuration.calibration_parameters.left_cam
 
-    try:
-        zed.set_camera_settings(sl.VIDEO_SETTINGS.WHITEBALANCE_AUTO, 0)
-    except Exception:
-        pass
+    camera_matrix = np.array([
+        [calib.fx, 0.0, calib.cx],
+        [0.0, calib.fy, calib.cy],
+        [0.0, 0.0, 1.0]
+    ], dtype=np.float64)
 
-    # You can tune these if needed
-    # Safe defaults; if unsupported, they will be ignored
-    try:
-        zed.set_camera_settings(sl.VIDEO_SETTINGS.EXPOSURE, 50)
-    except Exception:
-        pass
+    dist_coeffs = np.array(calib.disto, dtype=np.float64)
 
-    try:
-        zed.set_camera_settings(sl.VIDEO_SETTINGS.GAIN, 50)
-    except Exception:
-        pass
+    return camera_matrix, dist_coeffs
 
-    try:
-        zed.set_camera_settings(sl.VIDEO_SETTINGS.SHARPNESS, 4)
-    except Exception:
-        pass
+
+# =========================================================
+# Checkerboard pose helpers
+# =========================================================
+def build_object_points(pattern_size, square_size_m):
+    cols, rows = pattern_size
+    objp = np.zeros((cols * rows, 3), np.float32)
+    objp[:, :2] = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2)
+    objp *= square_size_m
+    return objp
+
+
+def estimate_board_pose(pattern_size, corners, camera_matrix, dist_coeffs):
+    objp = build_object_points(pattern_size, SQUARE_SIZE_M)
+
+    ok, rvec, tvec = cv2.solvePnP(
+        objp,
+        corners,
+        camera_matrix,
+        dist_coeffs,
+        flags=cv2.SOLVEPNP_ITERATIVE
+    )
+
+    if not ok:
+        return False, None, None
+
+    return True, rvec, tvec
 
 
 # =========================================================
@@ -282,6 +304,14 @@ def detect_checkerboard_robust(bgr, patterns):
     return False, None, None, vis, "none"
 
 
+def draw_axes_on_board(vis, camera_matrix, dist_coeffs, rvec, tvec, axis_len=0.06):
+    try:
+        cv2.drawFrameAxes(vis, camera_matrix, dist_coeffs, rvec, tvec, axis_len, 2)
+    except Exception:
+        pass
+    return vis
+
+
 def draw_overlay(vis, found, pattern_size, method_name, stable_count, num_saved, target_num):
     h, w = vis.shape[:2]
 
@@ -378,6 +408,7 @@ def main():
     print("=" * 72)
     print(f"Robot IP          : {ROBOT_IP}")
     print(f"Save file         : {SAVE_FILE}")
+    print(f"Image save dir    : {IMAGE_SAVE_DIR}")
     print(f"Angle unit        : {'radian' if USE_RADIANS else 'degree'}")
     print(f"Target pose count : {TARGET_NUM_POSES}")
     print(f"Patterns to test  : {PATTERNS_TO_TEST}")
@@ -387,7 +418,8 @@ def main():
     print("1. Put robot into manual / drag mode.")
     print("2. Move robot until checkerboard is fully visible and stably detected.")
     print("3. Press 's' to save the current robot pose.")
-    print("4. Press 'q' to quit.")
+    print("4. At the same time, current image will be saved.")
+    print("5. Press 'q' to quit.")
     print()
 
     arm = None
@@ -396,13 +428,20 @@ def main():
     stable_count = 0
 
     try:
+        IMAGE_SAVE_DIR.mkdir(parents=True, exist_ok=True)
+
         arm = connect_arm(ROBOT_IP)
 
         zed, runtime, image_mat = create_zed()
-        #set_zed_camera_params(zed)
+        camera_matrix, dist_coeffs = get_camera_intrinsics(zed)
 
         cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(WINDOW_NAME, 1600, 900)
+
+        latest_tvec = None
+        latest_rvec = None
+        latest_pattern_size = None
+        latest_method_name = "none"
 
         while True:
             grab_status = zed.grab(runtime)
@@ -424,8 +463,21 @@ def main():
                 frame_bgr, PATTERNS_TO_TEST
             )
 
+            latest_tvec = None
+            latest_rvec = None
+            latest_pattern_size = pattern_size
+            latest_method_name = method_name
+
             if found:
                 stable_count += 1
+
+                ok_pose, rvec, tvec = estimate_board_pose(
+                    pattern_size, corners, camera_matrix, dist_coeffs
+                )
+                if ok_pose:
+                    latest_rvec = rvec
+                    latest_tvec = tvec
+                    vis = draw_axes_on_board(vis, camera_matrix, dist_coeffs, rvec, tvec)
             else:
                 stable_count = 0
 
@@ -438,6 +490,19 @@ def main():
                 num_saved=len(records),
                 target_num=TARGET_NUM_POSES,
             )
+
+            if latest_tvec is not None:
+                tx, ty, tz = latest_tvec.reshape(-1)
+                cv2.putText(
+                    vis,
+                    f"Board in cam (m): x={tx:.3f}, y={ty:.3f}, z={tz:.3f}",
+                    (20, 220),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 0),
+                    2,
+                    cv2.LINE_AA,
+                )
 
             if DISPLAY_SCALE != 1.0:
                 vis_show = cv2.resize(
@@ -476,7 +541,33 @@ def main():
                     print(f"[Error] Failed to read robot state: {e}")
                     continue
 
+                # Save current camera image separately
                 idx = len(records)
+                img_name = f"pose_{idx:03d}_{compact_time_str()}.png"
+                img_path = IMAGE_SAVE_DIR / img_name
+
+                ok_img = cv2.imwrite(str(img_path), frame_bgr)
+                if ok_img:
+                    print(f"Image saved: {img_path}")
+                else:
+                    print(f"[Warning] Failed to save image: {img_path}")
+
+                # Print robot TCP xyzrpy
+                x, y, z, roll, pitch, yaw = pose_rpy
+                print("\n[Robot TCP xyzrpy]")
+                print(f"x={x:.6f}, y={y:.6f}, z={z:.6f}")
+                print(f"roll={roll:.6f}, pitch={pitch:.6f}, yaw={yaw:.6f}")
+
+                # Print checkerboard position in camera frame
+                if latest_tvec is not None:
+                    bx, by, bz = latest_tvec.reshape(-1)
+                    print("\n[Board position in camera frame (m)]")
+                    print(f"x={bx:.6f}, y={by:.6f}, z={bz:.6f}")
+                else:
+                    print("\n[Board position in camera frame (m)]")
+                    print("unavailable")
+
+                # Original JSON record format unchanged
                 record = build_pose_record(idx, pose_rpy, pose_aa, joints)
                 records.append(record)
 
@@ -485,8 +576,8 @@ def main():
                 print(f"  tcp_pose_rpy : {record['tcp_pose_rpy']}")
                 print(f"  tcp_pose_aa  : {record['tcp_pose_aa']}")
                 print(f"  joint_angles : {record['joint_angles']}")
-                print(f"  detected pattern: {pattern_size}")
-                print(f"  detection method: {method_name}")
+                print(f"  detected pattern: {latest_pattern_size}")
+                print(f"  detection method: {latest_method_name}")
 
                 output = {
                     "meta": {

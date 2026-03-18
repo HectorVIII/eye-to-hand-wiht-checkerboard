@@ -34,11 +34,20 @@ from xarm.wrapper import XArmAPI
 # Hard-coded hand-eye result (camera -> base)
 # =========================================================
 T_cam2base = np.array([
-    [-0.691532644,  0.326676329, -0.644255523,  0.853619759],
-    [ 0.722295719,  0.302279846, -0.622025553,  0.707727934],
-    [-0.008455565, -0.895493981, -0.444993295,  0.586156444],
+    [-0.483071955,  0.520801933, -0.703851428,  0.835195325],
+    [ 0.875557739,  0.281511210, -0.392619515,  0.717600193],
+    [-0.006334936, -0.805926042, -0.591982334,  0.530602896],
     [ 0.0,          0.0,          0.0,          1.0        ],
 ], dtype=np.float64)
+
+# Running method: PARK
+#   camera_in_base = [0.835195325, 0.717600193, 0.530602896]
+#   trans_mean = 0.200780 m
+#   trans_max  = 0.430585 m
+#   rot_mean   = 25.4708 deg
+#   rot_max    = 52.1918 deg
+#   score      = 0.455488
+
 
 # =========================================================
 # User settings
@@ -48,8 +57,8 @@ USE_RADIANS = True
 
 WINDOW_NAME = "ZED Wrist Detect -> xArm Move Once"
 
-# BODY_34 right wrist index
-RIGHT_WRIST_IDX = 14
+# BODY_18 right wrist index
+RIGHT_WRIST_IDX = 17
 USE_KEYPOINT_NAME = "RIGHT_WRIST"
 
 # ZED settings
@@ -77,11 +86,11 @@ STATIC_RADIUS_M = 0.04
 # Target in robot base frame
 # Move to wrist directly: [0, 0, 0]
 # Move above wrist by 20 cm: [0, 0, 0.20]
-WRIST_TARGET_OFFSET_M = np.array([0.0, 0.0, 0.02], dtype=np.float64)
+WRIST_TARGET_OFFSET_M = np.array([0.0, 0.0, 0.0], dtype=np.float64)
 
 # Robot motion
-MOVE_SPEED_MM_S = 40
-MOVE_ACC_MM_S2 = 100
+MOVE_SPEED_MM_S = 60
+MOVE_ACC_MM_S2 = 120
 WAIT_AFTER_MOVE_S = 0.5
 
 # Safety workspace in base frame (meters)

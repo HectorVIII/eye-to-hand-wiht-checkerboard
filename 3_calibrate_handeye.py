@@ -37,7 +37,7 @@ import numpy as np
 # =========================================================
 # User settings
 # =========================================================
-SAMPLES_FILE = Path("calib_dataset/samples.json")
+SAMPLES_FILE = Path("calib_dataset/manual_samples_01.json")
 OUTPUT_FILE = Path("calib_dataset/handeye_result.json")
 
 METHOD_MAP = {
