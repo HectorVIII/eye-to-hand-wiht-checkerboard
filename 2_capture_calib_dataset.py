@@ -58,8 +58,8 @@ USE_HD720 = True
 WINDOW_NAME = "Capture Calibration Dataset"
 
 # Motion parameters
-SPEED_MM_S = 40
-ACC_MM_S2 = 100
+SPEED_MM_S = 60
+ACC_MM_S2 = 120
 WAIT_AFTER_MOVE_S = 3.0
 
 # Two-stage safe motion

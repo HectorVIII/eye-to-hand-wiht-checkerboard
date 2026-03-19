@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 """
 manual_capture_calib_dataset.py
@@ -47,18 +46,17 @@ from xarm.wrapper import XArmAPI
 ROBOT_IP = "192.168.1.225"
 
 SAVE_DIR = Path("calib_dataset")
-IMAGE_DIR = SAVE_DIR / "images_01"
-SAMPLES_FILE = SAVE_DIR / "manual_samples_01.json"
+RUN_TIMESTAMP = datetime.now().strftime("%m%d_%H%M%S")
+IMAGE_DIR = SAVE_DIR / f"images_{RUN_TIMESTAMP}"
+SAMPLES_FILE = SAVE_DIR / f"manual_samples_{RUN_TIMESTAMP}.json"
 
-USE_RADIANS = True
+USE_RADIANS = True  # Keep angles in radians because cv2.Rodrigues expects axis-angle rotation vectors in radian units.
 TARGET_NUM_SAMPLES = 40
 
 # Zivid 7x8 squares -> 6x7 inner corners
 PATTERN_SIZE = (6, 7)
-SQUARE_SIZE_M = 0.03
+SQUARE_SIZE_M = 0.03    # 3cm squares, adjust if using different checkerboard
 
-# ZED settings
-USE_HD720 = True
 WINDOW_NAME = "Manual Capture Calibration Dataset"
 
 # Detection settings
@@ -80,6 +78,7 @@ def now_str():
 
 
 def round_list(values, digits=6):
+    """Convert values to floats and round each item to the given precision."""
     return [round(float(v), digits) for v in values]
 
 
@@ -152,7 +151,7 @@ def pose_aa_to_transform(pose_aa):
 def create_zed():
     zed = sl.Camera()
     init = sl.InitParameters()
-    init.camera_resolution = sl.RESOLUTION.HD720 if USE_HD720 else sl.RESOLUTION.HD1080
+    init.camera_resolution = sl.RESOLUTION.HD720
     init.depth_mode = sl.DEPTH_MODE.NONE
     init.coordinate_units = sl.UNIT.METER
 
@@ -425,7 +424,7 @@ def main():
         arm = connect_arm(ROBOT_IP)
 
         zed, runtime, image_mat = create_zed()
-        #set_zed_camera_params(zed)
+        set_zed_camera_params(zed)
         camera_matrix, dist_coeffs = get_left_camera_intrinsics(zed)
 
         print("Camera matrix:")

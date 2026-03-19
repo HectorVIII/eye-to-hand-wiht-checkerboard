@@ -58,7 +58,7 @@ USE_RADIANS = True
 WINDOW_NAME = "ZED Wrist Detect -> xArm Move Once"
 
 # BODY_18 right wrist index
-RIGHT_WRIST_IDX = 17
+RIGHT_WRIST_IDX = 15
 USE_KEYPOINT_NAME = "RIGHT_WRIST"
 
 # ZED settings

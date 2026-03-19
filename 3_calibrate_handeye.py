@@ -38,7 +38,7 @@ import numpy as np
 # User settings
 # =========================================================
 SAMPLES_FILE = Path("calib_dataset/manual_samples_01.json")
-OUTPUT_FILE = Path("calib_dataset/handeye_result.json")
+OUTPUT_FILE = Path("calib_dataset/handeye_result_0319.json")
 
 METHOD_MAP = {
     "TSAI": cv2.CALIB_HAND_EYE_TSAI,
