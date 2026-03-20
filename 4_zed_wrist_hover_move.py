@@ -44,8 +44,6 @@ T_cam2base = np.array([
 #   camera_in_base = [0.835195325, 0.717600193, 0.530602896]
 #   trans_mean = 0.200780 m
 #   trans_max  = 0.430585 m
-#   rot_mean   = 25.4708 deg
-#   rot_max    = 52.1918 deg
 #   score      = 0.455488
 
 
@@ -62,7 +60,6 @@ RIGHT_WRIST_IDX = 15
 USE_KEYPOINT_NAME = "RIGHT_WRIST"
 
 # ZED settings
-USE_HD720 = True
 CAMERA_FPS = 60
 COORDINATE_SYSTEM = sl.COORDINATE_SYSTEM.IMAGE
 DEPTH_MODE = sl.DEPTH_MODE.NEURAL
@@ -232,7 +229,7 @@ def create_zed():
     zed = sl.Camera()
 
     init_params = sl.InitParameters()
-    init_params.camera_resolution = sl.RESOLUTION.HD720 if USE_HD720 else sl.RESOLUTION.HD1080
+    init_params.camera_resolution = sl.RESOLUTION.HD1080
     init_params.camera_fps = CAMERA_FPS
     init_params.depth_mode = DEPTH_MODE
     init_params.coordinate_units = sl.UNIT.METER

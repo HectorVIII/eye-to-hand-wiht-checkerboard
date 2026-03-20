@@ -4,9 +4,9 @@
 """
 capture_calib_dataset.py
 
-Read pre-collected robot poses from robot_poses_20.json, move the xArm
-automatically, detect the checkerboard with ZED2, estimate target pose
-in camera frame, and save a full hand-eye dataset.
+Read pre-collected robot poses from robot_poses_30.json, move the xArm
+automatically by JOINT ANGLES, detect the checkerboard with ZED2,
+estimate target pose in camera frame, and save a full hand-eye dataset.
 
 Output:
     calib_dataset/
@@ -25,7 +25,6 @@ Each saved sample contains:
 """
 
 import json
-import math
 import sys
 import time
 from pathlib import Path
@@ -57,15 +56,23 @@ SQUARE_SIZE_M = 0.03
 USE_HD720 = True
 WINDOW_NAME = "Capture Calibration Dataset"
 
-# Motion parameters
-SPEED_MM_S = 60
-ACC_MM_S2 = 120
-WAIT_AFTER_MOVE_S = 3.0
+# =========================================================
+# Stable joint-space motion parameters
+# =========================================================
+JOINT_SPEED_RAD_S = 0.25       # slower and safer
+JOINT_ACC_RAD_S2 = 0.5         # slower and safer
+WAIT_AFTER_MOVE_S = 2.5
 
-# Two-stage safe motion
-SAFE_Z_MM = 450.0
-MIN_Z_MM = 120.0
-MAX_Z_MM = 650.0
+# Optional safety waypoint:
+# if enabled, robot first goes to a safe joint pose, then to target joint pose
+USE_SAFE_INTERMEDIATE_JOINT = False
+
+# Example placeholder safe joint pose (edit if you want to use it)
+# Must match your robot and your use_radians setting
+SAFE_INTERMEDIATE_JOINT = [0.0, -0.35, -0.35, 0.0, 0.70, 0.0, 0.0]
+
+# If any one joint jump is too large, print warning
+MAX_SINGLE_JOINT_STEP_RAD = 1.2
 
 # Detection / capture behavior
 STABLE_DETECTION_FRAMES = 5
@@ -112,8 +119,11 @@ def load_pose_file(path):
         raise ValueError("Pose file contains no poses")
 
     for i, p in enumerate(poses):
-        if "tcp_pose_aa" not in p:
-            raise ValueError(f"Pose #{i} missing 'tcp_pose_aa'")
+        if "joint_angles" not in p:
+            raise ValueError(f"Pose #{i} missing 'joint_angles'")
+        joints = p["joint_angles"]
+        if not isinstance(joints, list) or len(joints) != 7:
+            raise ValueError(f"Pose #{i} has invalid 'joint_angles' (must be length 7)")
 
     return data
 
@@ -146,6 +156,25 @@ def connect_arm(robot_ip):
     return arm
 
 
+def ensure_arm_ready(arm):
+    try:
+        arm.motion_enable(enable=True)
+    except Exception:
+        pass
+
+    try:
+        arm.set_mode(0)
+    except Exception:
+        pass
+
+    try:
+        arm.set_state(0)
+    except Exception:
+        pass
+
+    time.sleep(0.2)
+
+
 def get_robot_state(arm, use_radians=True):
     code_rpy, pose_rpy = arm.get_position(is_radian=use_radians)
     code_aa, pose_aa = arm.get_position_aa(is_radian=use_radians)
@@ -161,50 +190,62 @@ def get_robot_state(arm, use_radians=True):
     return pose_rpy, pose_aa, joints
 
 
-def move_pose_aa(arm, pose_aa, speed=SPEED_MM_S, mvacc=ACC_MM_S2, wait=True):
-    code = arm.set_position_aa(
-        axis_angle_pose=pose_aa,
+def move_joints(arm, joints, speed=JOINT_SPEED_RAD_S, mvacc=JOINT_ACC_RAD_S2, wait=True):
+    """
+    Move robot by joint angles instead of TCP pose.
+    This is much more stable for replaying manually collected calibration poses.
+    """
+    ensure_arm_ready(arm)
+
+    code = arm.set_servo_angle(
+        angle=joints,
         speed=speed,
         mvacc=mvacc,
         is_radian=USE_RADIANS,
         wait=wait,
     )
     if code != 0:
-        raise RuntimeError(f"set_position_aa failed, code={code}")
+        raise RuntimeError(f"set_servo_angle failed, code={code}")
 
 
-def clamp_z(z_mm):
-    return max(MIN_Z_MM, min(MAX_Z_MM, z_mm))
+def joint_diff_abs(a, b):
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    return np.abs(a - b)
 
 
-def move_two_stage_safe(arm, target_pose_aa):
+def print_joint_move_info(current_joints, target_joints):
+    diff = joint_diff_abs(current_joints, target_joints)
+    max_idx = int(np.argmax(diff))
+    max_val = float(diff[max_idx])
+
+    print("Current joints:", [round(float(v), 4) for v in current_joints])
+    print("Target  joints:", [round(float(v), 4) for v in target_joints])
+    print("Joint abs diff:", [round(float(v), 4) for v in diff])
+    print(f"Max joint step : J{max_idx + 1} = {max_val:.4f} rad")
+
+    if max_val > MAX_SINGLE_JOINT_STEP_RAD:
+        print("[Warning] Large single-joint jump detected. Consider reordering poses or inserting a safe middle pose.")
+
+
+def move_joint_stable(arm, target_joints):
     """
-    Safer motion:
-      1) lift current pose to SAFE_Z_MM
-      2) move to target XY + SAFE_Z_MM with target orientation
-      3) descend to full target pose
+    Stable replay:
+      1) read current joint state
+      2) optionally go to a safe intermediate joint pose
+      3) move to target joints
+      4) wait a bit after arrival
     """
-    _, current_aa, _ = get_robot_state(arm, use_radians=USE_RADIANS)
+    _, _, current_joints = get_robot_state(arm, use_radians=USE_RADIANS)
+    print_joint_move_info(current_joints, target_joints)
 
-    curr = list(current_aa)
-    target = list(target_pose_aa)
+    if USE_SAFE_INTERMEDIATE_JOINT:
+        print("Moving to safe intermediate joint pose ...")
+        move_joints(arm, SAFE_INTERMEDIATE_JOINT, wait=True)
+        time.sleep(0.6)
 
-    # stage 1: raise current pose vertically if needed
-    stage1 = curr.copy()
-    stage1[2] = clamp_z(max(curr[2], SAFE_Z_MM))
-
-    # stage 2: move over target XY at safe Z, already using target orientation
-    stage2 = target.copy()
-    stage2[2] = clamp_z(max(target[2], SAFE_Z_MM))
-
-    # stage 3: final target
-    stage3 = target.copy()
-    stage3[2] = clamp_z(stage3[2])
-
-    # Execute
-    move_pose_aa(arm, stage1, wait=True)
-    move_pose_aa(arm, stage2, wait=True)
-    move_pose_aa(arm, stage3, wait=True)
+    print("Moving to target joint pose ...")
+    move_joints(arm, target_joints, wait=True)
     time.sleep(WAIT_AFTER_MOVE_S)
 
 
@@ -258,7 +299,6 @@ def get_left_camera_intrinsics(zed):
     cx = float(calib.cx)
     cy = float(calib.cy)
 
-    # ZED SDK usually provides 5 distortion terms
     dist = np.array(calib.disto, dtype=np.float64).reshape(-1, 1)
 
     camera_matrix = np.array(
@@ -391,7 +431,7 @@ def pose_aa_to_transform(pose_aa):
 
 
 def draw_overlay(vis, pose_idx, total_poses, found, stable_count, method_name, reproj_error=None):
-    h, w = vis.shape[:2]
+    h, _ = vis.shape[:2]
     stable = stable_count >= STABLE_DETECTION_FRAMES
 
     if found and stable:
@@ -453,17 +493,39 @@ def make_sample_record(sample_id, pose_record, pose_rpy, pose_aa, joints,
     }
 
 
+def save_samples_json(samples):
+    output = {
+        "meta": {
+            "created_at": now_str(),
+            "robot_ip": ROBOT_IP,
+            "robot_model": "xArm7",
+            "pose_file": str(POSE_FILE),
+            "pattern_size": list(PATTERN_SIZE),
+            "square_size_m": SQUARE_SIZE_M,
+            "use_radians": USE_RADIANS,
+            "angle_unit": "radian" if USE_RADIANS else "degree",
+            "position_unit": "mm",
+            "num_samples": len(samples),
+            "motion_type": "joint_space_replay",
+        },
+        "samples": samples,
+    }
+    save_json(SAMPLES_FILE, output)
+
+
 # =========================================================
 # Main capture routine
 # =========================================================
 def main():
     print("=" * 72)
-    print("Capture Calibration Dataset")
+    print("Capture Calibration Dataset (JOINT REPLAY VERSION)")
     print("=" * 72)
     print(f"Pose file     : {POSE_FILE}")
     print(f"Save dir      : {SAVE_DIR}")
     print(f"Pattern size  : {PATTERN_SIZE}")
     print(f"Square size   : {SQUARE_SIZE_M} m")
+    print(f"Joint speed   : {JOINT_SPEED_RAD_S} rad/s")
+    print(f"Joint acc     : {JOINT_ACC_RAD_S2} rad/s^2")
     print()
 
     pose_file_data = load_pose_file(POSE_FILE)
@@ -496,12 +558,11 @@ def main():
             print("-" * 72)
             print(f"Moving to pose {pose_idx + 1} / {len(pose_records)}")
 
-            target_pose_aa = pose_record["tcp_pose_aa"]
-            move_two_stage_safe(arm, target_pose_aa)
+            target_joints = pose_record["joint_angles"]
+            move_joint_stable(arm, target_joints)
 
             stable_count = 0
             last_found = False
-            last_vis = None
             last_corners = None
             last_method = "none"
             last_reproj_error = None
@@ -528,14 +589,10 @@ def main():
 
                 found, corners, vis, method_name = detect_checkerboard_robust(frame_bgr, PATTERN_SIZE)
 
-                reproj_error = None
-                R_target2cam = None
-                t_target2cam = None
-
                 if found:
                     try:
                         img_pts = corners.reshape(-1, 2)
-                        R_target2cam, t_target2cam, reproj_error = estimate_target_pose(
+                        _, _, reproj_error = estimate_target_pose(
                             object_points=object_points,
                             image_points=img_pts,
                             camera_matrix=camera_matrix,
@@ -571,13 +628,14 @@ def main():
 
                 if DISPLAY_SCALE != 1.0:
                     vis_show = cv2.resize(
-                        vis, None, fx=DISPLAY_SCALE, fy=DISPLAY_SCALE,
+                        vis, None,
+                        fx=DISPLAY_SCALE,
+                        fy=DISPLAY_SCALE,
                         interpolation=cv2.INTER_LINEAR
                     )
                 else:
                     vis_show = vis
 
-                last_vis = vis
                 cv2.imshow(WINDOW_NAME, vis_show)
                 key = cv2.waitKey(1) & 0xFF
 
@@ -602,13 +660,17 @@ def main():
                         print("[Skip] Checkerboard not ready.")
                         continue
 
-                    # Read robot state at capture time
                     pose_rpy, pose_aa, joints = get_robot_state(arm, use_radians=USE_RADIANS)
 
-                    # gripper->base from current pose_aa
+                    # To test the unit is mm
+                    print(f"[DEBUG] pose_aa raw = {pose_aa}")
+                    print(f"[DEBUG] XYZ (should be ~hundreds of mm): x={pose_aa[0]:.2f}, y={pose_aa[1]:.2f}, z={pose_aa[2]:.2f}")
+
                     R_gripper2base, t_gripper2base = pose_aa_to_transform(pose_aa)
 
-                    # Recompute target pose from latest corners for safety
+                    # To test the unit is mm
+                    print(f"[DEBUG] t_gripper2base (m) = {t_gripper2base}")
+    
                     img_pts = last_corners.reshape(-1, 2)
                     R_target2cam, t_target2cam, reproj_error = estimate_target_pose(
                         object_points=object_points,
@@ -635,23 +697,7 @@ def main():
                         reproj_error=reproj_error,
                     )
                     samples.append(sample)
-
-                    output = {
-                        "meta": {
-                            "created_at": now_str(),
-                            "robot_ip": ROBOT_IP,
-                            "robot_model": "xArm7",
-                            "pose_file": str(POSE_FILE),
-                            "pattern_size": list(PATTERN_SIZE),
-                            "square_size_m": SQUARE_SIZE_M,
-                            "use_radians": USE_RADIANS,
-                            "angle_unit": "radian" if USE_RADIANS else "degree",
-                            "position_unit": "mm",
-                            "num_samples": len(samples),
-                        },
-                        "samples": samples,
-                    }
-                    save_json(SAMPLES_FILE, output)
+                    save_samples_json(samples)
 
                     print(f"[Saved] sample_{sample_id:03d}.png")
                     print(f"        reproj_error = {reproj_error:.4f} px")
@@ -664,22 +710,7 @@ def main():
     except KeyboardInterrupt:
         print("\nInterrupted by user.")
         if len(samples) > 0:
-            output = {
-                "meta": {
-                    "created_at": now_str(),
-                    "robot_ip": ROBOT_IP,
-                    "robot_model": "xArm7",
-                    "pose_file": str(POSE_FILE),
-                    "pattern_size": list(PATTERN_SIZE),
-                    "square_size_m": SQUARE_SIZE_M,
-                    "use_radians": USE_RADIANS,
-                    "angle_unit": "radian" if USE_RADIANS else "degree",
-                    "position_unit": "mm",
-                    "num_samples": len(samples),
-                },
-                "samples": samples,
-            }
-            save_json(SAMPLES_FILE, output)
+            save_samples_json(samples)
             print(f"Partial samples saved: {len(samples)}")
     except Exception as e:
         print(f"\n[Fatal Error] {e}")

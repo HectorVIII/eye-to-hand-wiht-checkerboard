@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 """
 calibrate_handeye.py
 
-Compute eye-to-hand calibration from saved samples.json.
+Compute eye-to-hand calibration from saved json file.
 
 Input:
     calib_dataset/samples.json
@@ -29,16 +28,18 @@ Result:
 
 import json
 from pathlib import Path
+from datetime import datetime
 
 import cv2
 import numpy as np
 
 
 # =========================================================
-# User settings
+# Settings
 # =========================================================
+RUN_TIMESTAMP = datetime.now().strftime("%m%d_%H%M%S")
 SAMPLES_FILE = Path("calib_dataset/manual_samples_01.json")
-OUTPUT_FILE = Path("calib_dataset/handeye_result_0319.json")
+OUTPUT_FILE = Path(f"calib_dataset/handeye_result_{RUN_TIMESTAMP}.json")
 
 METHOD_MAP = {
     "TSAI": cv2.CALIB_HAND_EYE_TSAI,
@@ -50,38 +51,38 @@ METHOD_MAP = {
 
 
 # =========================================================
-# Helper functions
+# Functions
 # =========================================================
 def load_samples(path):
     with open(path, "r", encoding="utf-8") as f:
-        data = json.load(f)
+        data = json.load(f) # Load the entire JSON content into a Python dictionary
 
     if "samples" not in data:
         raise ValueError("samples.json does not contain key 'samples'")
 
     samples = data["samples"]
-    if not isinstance(samples, list) or len(samples) < 3:
-        raise ValueError("Need at least 3 samples for hand-eye calibration")
+    if not isinstance(samples, list) or len(samples) < 20:
+        raise ValueError("Need at least 20 samples for accurate hand-eye calibration")
 
-    return data, samples
+    return samples
 
 
 def to_numpy_rotation(R):
+    """Convert input rotation data to a 3x3 float64 NumPy matrix."""
     R = np.array(R, dtype=np.float64).reshape(3, 3)
     return R
 
 
 def to_numpy_translation(t):
+    """Convert input translation data to a 3x1 float64 NumPy column vector."""
     t = np.array(t, dtype=np.float64).reshape(3, 1)
     return t
 
 
 def invert_transform(R_ab, t_ab):
     """
-    Invert transform:
-        T_ab = [R_ab, t_ab]
-    return:
-        T_ba = [R_ba, t_ba]
+    Invert gripper2base to base2gripper, because cv2.calibrateHandEye()
+    requires base2gripper for eye-to-hand calibration.
     """
     R_ba = R_ab.T
     t_ba = -R_ba @ t_ab
@@ -89,41 +90,23 @@ def invert_transform(R_ab, t_ab):
 
 
 def make_homogeneous(R, t):
+    """
+    Pack R (3x3) and t (3x1) into a 4x4 homogeneous transform matrix.
+    """
     T = np.eye(4, dtype=np.float64)
     T[:3, :3] = R
     T[:3, 3] = t.reshape(3)
     return T
 
 
-def rotation_matrix_to_rvec(R):
-    rvec, _ = cv2.Rodrigues(R)
-    return rvec.reshape(3)
-
-
-def rotation_error_deg(R1, R2):
-    """
-    Geodesic rotation error in degrees.
-    """
-    R = R1.T @ R2
-    trace_val = np.trace(R)
-    cos_theta = np.clip((trace_val - 1.0) / 2.0, -1.0, 1.0)
-    theta = np.arccos(cos_theta)
-    return np.degrees(theta)
-
-
 def evaluate_cam2base_consistency(R_cam2base, t_cam2base, samples):
     """
-    Evaluate consistency by estimating target pose in base frame for each sample:
-
-        T_target2base = T_cam2base @ T_target2cam
-
-    If calibration is good, all estimated target poses in base should be
-    mutually more consistent.
-
-    This is not a perfect physical metric, but it is a useful sanity check.
+    Evaluate calibration quality by checking how consistently the estimated
+    camera position (t_cam2base) is across all samples.
+    Since the camera is fixed, t_cam2base should be identical for every sample.
+    A smaller trans_mean_m indicates a better calibration result.
     """
     t_list = []
-    R_list = []
 
     T_cam2base = make_homogeneous(R_cam2base, t_cam2base)
 
@@ -133,45 +116,27 @@ def evaluate_cam2base_consistency(R_cam2base, t_cam2base, samples):
         T_target2cam = make_homogeneous(R_target2cam, t_target2cam)
 
         T_target2base = T_cam2base @ T_target2cam
-        R_target2base = T_target2base[:3, :3]
         t_target2base = T_target2base[:3, 3]
-
-        R_list.append(R_target2base)
         t_list.append(t_target2base)
 
     t_stack = np.stack(t_list, axis=0)
     t_mean = np.mean(t_stack, axis=0)
-
     trans_errors = np.linalg.norm(t_stack - t_mean, axis=1)
     trans_mean = float(np.mean(trans_errors))
     trans_max = float(np.max(trans_errors))
 
-    # rotation consistency against mean-like reference (use first as anchor after averaging is nontrivial)
-    R_ref = R_list[0]
-    rot_errors = [rotation_error_deg(R_ref, R_i) for R_i in R_list]
-    rot_mean = float(np.mean(rot_errors))
-    rot_max = float(np.max(rot_errors))
-
-    # smaller is better
-    score = trans_mean + 0.01 * rot_mean
-
     return {
         "trans_mean_m": trans_mean,
         "trans_max_m": trans_max,
-        "rot_mean_deg": rot_mean,
-        "rot_max_deg": rot_max,
-        "score": float(score),
+        "score": trans_mean,  # lower is better
     }
 
 
 def collect_eye_to_hand_inputs(samples):
     """
-    For eye-to-hand:
-        OpenCV calibrateHandEye is commonly used with base->gripper
-        plus target->cam, then interpreted as cam->base.
-
-    So here we convert:
-        gripper->base  -->  base->gripper
+    Prepare inputs for cv2.calibrateHandEye() in eye-to-hand configuration.
+    Converts JSON lists to NumPy arrays, and inverts gripper2base to base2gripper
+    as required by the eye-to-hand formulation.
     """
     R_base2gripper = []
     t_base2gripper = []
@@ -199,7 +164,7 @@ def collect_eye_to_hand_inputs(samples):
 # Main
 # =========================================================
 def main():
-    data, samples = load_samples(SAMPLES_FILE)
+    samples = load_samples(SAMPLES_FILE)
 
     print("=" * 72)
     print("Eye-to-Hand Calibration")
@@ -235,17 +200,13 @@ def main():
                 "method": method_name,
                 "R_cam2base": R_cam2base.round(9).tolist(),
                 "t_cam2base_m": t_cam2base.reshape(3).round(9).tolist(),
-                "rvec_cam2base": rotation_matrix_to_rvec(R_cam2base).round(9).tolist(),
-                "camera_in_base_m": t_cam2base.reshape(3).round(9).tolist(),
                 "evaluation": eval_info,
             }
             results.append(result)
 
-            print(f"  camera_in_base = {result['camera_in_base_m']}")
+            print(f"  camera_in_base = {result['t_cam2base_m']}")
             print(f"  trans_mean = {eval_info['trans_mean_m']:.6f} m")
             print(f"  trans_max  = {eval_info['trans_max_m']:.6f} m")
-            print(f"  rot_mean   = {eval_info['rot_mean_deg']:.4f} deg")
-            print(f"  rot_max    = {eval_info['rot_max_deg']:.4f} deg")
             print(f"  score      = {eval_info['score']:.6f}")
             print()
 
@@ -281,7 +242,7 @@ def main():
     print("=" * 72)
     print("Finished.")
     print(f"Best method: {best['method']}")
-    print(f"Best camera_in_base_m: {best['camera_in_base_m']}")
+    print(f"Best camera_in_base_m: {best['t_cam2base_m']}")
     print(f"Saved to: {OUTPUT_FILE.resolve()}")
 
 

@@ -290,8 +290,8 @@ def scale_corners_back(corners, scale):
 
 def detect_checkerboard_robust(bgr, pattern_size):
     """
-    Try checkerboard detection on serveral preprocessed image variants
-    and return the first successful result together with a visualiyation image.
+    Try checkerboard detection on several preprocessed image variants
+    and return the first successful result together with a visualization image.
     """
     vis = bgr.copy()
     variants = preprocess_variants(bgr)
@@ -310,8 +310,8 @@ def detect_checkerboard_robust(bgr, pattern_size):
 def estimate_target_pose(object_points, image_points, camera_matrix, dist_coeffs):
     """
     Solve target(board) pose in camera frame:
-    Estimate the checkerboard  pose in the camera frame from 3D to 2D
-    corner correspondences using solvePnP. and compute the mean reprojection error to test the precision.
+    Estimate the checkerboard pose in the camera frame from 3D to 2D
+    corner correspondences using solvePnP, and compute the mean reprojection error to test the precision.
       X_cam = R_target2cam * X_target + t_target2cam
     """
     obj = np.ascontiguousarray(object_points.reshape(-1, 1, 3), dtype=np.float32)
@@ -448,13 +448,9 @@ def main():
         cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(WINDOW_NAME, 1600, 900)
 
-        latest_corners = None
         latest_method = "none"
         latest_reproj_error = None
-        latest_R_target2cam = None
         latest_t_target2cam = None
-        latest_rvec = None
-        latest_tvec = None
 
         while True:
             grab_status = zed.grab(runtime)
@@ -472,13 +468,9 @@ def main():
 
             found, corners, vis, method_name = detect_checkerboard_robust(frame_bgr, PATTERN_SIZE)
 
-            latest_corners = None
             latest_method = method_name
             latest_reproj_error = None
-            latest_R_target2cam = None
             latest_t_target2cam = None
-            latest_rvec = None
-            latest_tvec = None
 
             if found:
                 try:
@@ -490,13 +482,9 @@ def main():
                         dist_coeffs=dist_coeffs,
                     )
                     stable_count += 1
-                    latest_corners = corners
                     latest_method = method_name
                     latest_reproj_error = reproj_error
-                    latest_R_target2cam = R_target2cam
                     latest_t_target2cam = t_target2cam
-                    latest_rvec = rvec
-                    latest_tvec = tvec
                     vis = draw_axes_on_board(vis, camera_matrix, dist_coeffs, rvec, tvec)
                 except Exception:
                     stable_count = 0
@@ -507,7 +495,7 @@ def main():
 
             vis = draw_overlay(
                 vis=vis,
-                found=(latest_corners is not None),
+                found=found,
                 stable_count=stable_count,
                 method_name=latest_method,
                 num_saved=len(samples),
@@ -531,7 +519,7 @@ def main():
                 break
 
             elif key == ord("s"):
-                if latest_corners is None:
+                if stable_count == 0:
                     print("[Skip] Checkerboard not detected.")
                     continue
 
@@ -540,6 +528,21 @@ def main():
                     continue
 
                 time.sleep(READ_STABLE_DELAY_S)
+
+                # Grab a fresh frame after the delay so corners and robot state are in sync
+                if zed.grab(runtime) != sl.ERROR_CODE.SUCCESS:
+                    print("[Error] Failed to grab fresh frame.")
+                    continue
+                zed.retrieve_image(image_mat, sl.VIEW.LEFT)
+                fresh_frame = to_bgr(image_mat.get_data())
+                if fresh_frame is None:
+                    print("[Error] Failed to retrieve fresh frame.")
+                    continue
+
+                found_fresh, corners_fresh, _, _ = detect_checkerboard_robust(fresh_frame, PATTERN_SIZE)
+                if not found_fresh:
+                    print("[Skip] Checkerboard lost in fresh frame, try again.")
+                    continue
 
                 try:
                     pose_rpy, pose_aa, joints = get_robot_state(arm, use_radians=USE_RADIANS)
@@ -550,7 +553,7 @@ def main():
                 try:
                     R_gripper2base, t_gripper2base = pose_aa_to_transform(pose_aa)
 
-                    img_pts = latest_corners.reshape(-1, 2)
+                    img_pts = corners_fresh.reshape(-1, 2)  # use fresh frame corners
                     R_target2cam, t_target2cam, reproj_error, _, _ = estimate_target_pose(
                         object_points=object_points,
                         image_points=img_pts,
@@ -564,7 +567,7 @@ def main():
                 sample_id = len(samples)
                 image_path = IMAGE_DIR / f"sample_{sample_id:03d}.png"
 
-                ok_img = cv2.imwrite(str(image_path), frame_bgr)
+                ok_img = cv2.imwrite(str(image_path), fresh_frame)  # save fresh frame
                 if not ok_img:
                     print(f"[Warning] Failed to save image: {image_path}")
                     continue
