@@ -41,7 +41,7 @@ from xarm.wrapper import XArmAPI
 
 
 # =========================================================
-# User settings
+# Parameter settings
 # =========================================================
 ROBOT_IP = "192.168.1.225"
 
@@ -50,7 +50,7 @@ RUN_TIMESTAMP = datetime.now().strftime("%m%d_%H%M%S")
 IMAGE_DIR = SAVE_DIR / f"images_{RUN_TIMESTAMP}"
 SAMPLES_FILE = SAVE_DIR / f"manual_samples_{RUN_TIMESTAMP}.json"
 
-USE_RADIANS = True  # Keep angles in radians because cv2.Rodrigues expects axis-angle rotation vectors in radian units.
+USE_RADIANS = True  # Set to False if you prefer degrees in saved samples.json
 TARGET_NUM_SAMPLES = 40
 
 # Zivid 7x8 squares -> 6x7 inner corners
@@ -60,9 +60,9 @@ SQUARE_SIZE_M = 0.03    # 3cm squares, adjust if using different checkerboard
 WINDOW_NAME = "Manual Capture Calibration Dataset"
 
 # Detection settings
-STABLE_DETECTION_FRAMES = 5
+STABLE_DETECTION_FRAMES = 5 # Number of consecutive frames with successful checkerboard detection required to consider it "stable"
 DISPLAY_SCALE = 1.3
-READ_STABLE_DELAY_S = 0.15
+READ_STABLE_DELAY_S = 0.15  # Delay after stable detection before reading robot state and saving sample, to reduce motion blur and ensure stable pose
 
 # Optional image quality settings for ZED
 SET_MANUAL_CAMERA_PARAMS = False
@@ -78,7 +78,7 @@ def now_str():
 
 
 def round_list(values, digits=6):
-    """Convert values to floats and round each item to the given precision."""
+    """Round a list of values to specified number of decimal places for cleaner JSON output."""
     return [round(float(v), digits) for v in values]
 
 
@@ -100,12 +100,12 @@ def connect_arm(robot_ip):
     arm.motion_enable(enable=True)
     arm.clean_warn()
     arm.clean_error()
-    arm.set_mode(0)
-    arm.set_state(0)
+    arm.set_mode(0)     # 0=position control
+    arm.set_state(0)    # 0=motion state, 3=pause state, 4=stop state， 6=deceleration stop state
 
     time.sleep(0.5)
 
-    code_state, state = arm.get_state()
+    code_state, state = arm.get_state() # state: 1=in motion, 2=sleeping, 3=suspended, 4=stopping
     code_err, err_warn = arm.get_err_warn_code()
 
     print("Connected.")
@@ -118,7 +118,7 @@ def connect_arm(robot_ip):
 
 
 def get_robot_state(arm, use_radians=True):
-    code_rpy, pose_rpy = arm.get_position(is_radian=use_radians)
+    code_rpy, pose_rpy = arm.get_position(is_radian=use_radians)    #let the value(roll/pitch/yaw) to return is an radian unit
     code_aa, pose_aa = arm.get_position_aa(is_radian=use_radians)
     code_j, joints = arm.get_servo_angle(is_radian=use_radians)
 
@@ -151,7 +151,7 @@ def pose_aa_to_transform(pose_aa):
 def create_zed():
     zed = sl.Camera()
     init = sl.InitParameters()
-    init.camera_resolution = sl.RESOLUTION.HD720
+    init.camera_resolution = sl.RESOLUTION.HD1080
     init.depth_mode = sl.DEPTH_MODE.NONE
     init.coordinate_units = sl.UNIT.METER
 
@@ -211,6 +211,9 @@ def get_left_camera_intrinsics(zed):
 
 
 def to_bgr(frame):
+    """
+    Convert an input image(BGRA) to 3-channel BGR format for OpenCV processing.
+    """
     if frame is None:
         return None
     if len(frame.shape) == 3 and frame.shape[2] == 4:
@@ -219,9 +222,14 @@ def to_bgr(frame):
 
 
 # =========================================================
-# Vision helpers
+# Checkerboard detection and pose estimation
 # =========================================================
 def build_object_points(pattern_size, square_size_m):
+    """
+    Build checkerboard corner coordinates in the target frame.
+    All points lie on the z=0 plane, with adjacent corners spaced
+    by square_size_m in meters.
+    """
     cols, rows = pattern_size
     objp = np.zeros((cols * rows, 3), np.float32)
     objp[:, :2] = np.mgrid[0:cols, 0:rows].T.reshape(-1, 2)
@@ -230,6 +238,10 @@ def build_object_points(pattern_size, square_size_m):
 
 
 def preprocess_variants(bgr):
+    """
+    Generate several grayscale preprocessing variants of the same image
+    to improve checkerboard detection under different lighting and scale conditions.
+    """
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
 
     variants = []
@@ -250,6 +262,10 @@ def preprocess_variants(bgr):
 
 
 def try_detect_sb(gray_img, pattern_size):
+    """
+    Detect checkerboard corners with the sector-based OpenCV detector
+    using robust flags for normalization, exhaustive search, and accuracy.
+    """
     flags = (
         cv2.CALIB_CB_NORMALIZE_IMAGE
         | cv2.CALIB_CB_EXHAUSTIVE
@@ -260,6 +276,10 @@ def try_detect_sb(gray_img, pattern_size):
 
 
 def scale_corners_back(corners, scale):
+    """
+    Map checkerboard corner coordinates from a resized image
+    back to the original image scale.
+    """
     if scale == 1.0:
         return corners
     out = corners.copy()
@@ -269,6 +289,10 @@ def scale_corners_back(corners, scale):
 
 
 def detect_checkerboard_robust(bgr, pattern_size):
+    """
+    Try checkerboard detection on serveral preprocessed image variants
+    and return the first successful result together with a visualiyation image.
+    """
     vis = bgr.copy()
     variants = preprocess_variants(bgr)
 
@@ -286,6 +310,8 @@ def detect_checkerboard_robust(bgr, pattern_size):
 def estimate_target_pose(object_points, image_points, camera_matrix, dist_coeffs):
     """
     Solve target(board) pose in camera frame:
+    Estimate the checkerboard  pose in the camera frame from 3D to 2D
+    corner correspondences using solvePnP. and compute the mean reprojection error to test the precision.
       X_cam = R_target2cam * X_target + t_target2cam
     """
     obj = np.ascontiguousarray(object_points.reshape(-1, 1, 3), dtype=np.float32)
@@ -312,15 +338,16 @@ def estimate_target_pose(object_points, image_points, camera_matrix, dist_coeffs
     return R_target2cam, t_target2cam, reproj_error, rvec, tvec
 
 
-def draw_axes_on_board(vis, camera_matrix, dist_coeffs, rvec, tvec, axis_len=0.06):
+def draw_axes_on_board(vis, camera_matrix, dist_coeffs, rvec, tvec, axis_len=0.10):
     try:
-        cv2.drawFrameAxes(vis, camera_matrix, dist_coeffs, rvec, tvec, axis_len, 2)
+        cv2.drawFrameAxes(vis, camera_matrix, dist_coeffs, rvec, tvec, axis_len, 3)
     except Exception:
         pass
     return vis
 
 
 def draw_overlay(vis, found, stable_count, method_name, num_saved, target_num, reproj_error=None, board_pos=None):
+    """Draw text overlay on the image to show detection status, method, reprojection error, and saved samples info."""
     h, _ = vis.shape[:2]
     stable = stable_count >= STABLE_DETECTION_FRAMES
 
@@ -397,19 +424,8 @@ def main():
     print("=" * 72)
     print("Manual Capture Calibration Dataset")
     print("=" * 72)
-    print(f"Robot IP          : {ROBOT_IP}")
     print(f"Save dir          : {SAVE_DIR}")
-    print(f"Pattern size      : {PATTERN_SIZE}")
-    print(f"Square size       : {SQUARE_SIZE_M} m")
-    print(f"Angle unit        : {'radian' if USE_RADIANS else 'degree'}")
     print(f"Target samples    : {TARGET_NUM_SAMPLES}")
-    print()
-
-    print("Instructions:")
-    print("1. Put robot into manual / drag mode.")
-    print("2. Move robot by hand until checkerboard is fully visible and stably detected.")
-    print("3. Press 's' to save one sample.")
-    print("4. Press 'q' to quit.")
     print()
 
     SAVE_DIR.mkdir(parents=True, exist_ok=True)
@@ -426,9 +442,6 @@ def main():
         zed, runtime, image_mat = create_zed()
         set_zed_camera_params(zed)
         camera_matrix, dist_coeffs = get_left_camera_intrinsics(zed)
-
-        print("Camera matrix:")
-        print(camera_matrix.ravel())
 
         object_points = build_object_points(PATTERN_SIZE, SQUARE_SIZE_M)
 
